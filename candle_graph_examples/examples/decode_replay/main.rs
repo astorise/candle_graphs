@@ -1,0 +1,78 @@
+//! Demonstrates `Cache::append_at`: a graph captured once around a single
+//! decode step, replayed at a *different* KV-cache position on every call by
+//! updating a device-resident position tensor between replays -- instead of
+//! `examples/cache`'s `append`, which bakes the write position into the graph
+//! at capture time and can only ever write to that one slot on replay.
+//!
+//! Run with: `cargo run --example decode_replay`
+
+use candle_graph::{cache::KvCache, Graph};
+use candle_graph_macro::GraphInputItem;
+
+use candle_core::{DType, Device, Tensor};
+
+const N_HEADS: usize = 2;
+const HEAD_DIM: usize = 4;
+const MAX_SEQ_LEN: usize = 8;
+const N_STEPS: u32 = 5;
+
+#[derive(GraphInputItem)]
+struct Inputs {
+    k: Tensor,
+    v: Tensor,
+    position: Tensor,
+}
+
+fn main() -> anyhow::Result<()> {
+    let device = Device::new_cuda_with_stream(0)?;
+
+    let mut cache = KvCache::new(2, MAX_SEQ_LEN);
+
+    let k = Tensor::zeros((1, N_HEADS, 1, HEAD_DIM), DType::F32, &device)?;
+    let v = Tensor::zeros((1, N_HEADS, 1, HEAD_DIM), DType::F32, &device)?;
+    let position = Tensor::new(&[0u32], &device)?;
+
+    // Capture once: one decode step, writing at whatever `position` holds when
+    // the graph runs -- not at a position fixed here during capture.
+    let graph = Graph::new(
+        |inputs: &Inputs| {
+            cache.append_at(&inputs.k, &inputs.v, &inputs.position)?;
+            Ok(())
+        },
+        &device,
+        Inputs { k, v, position },
+    )?;
+
+    // Replay it once per decode step, writing a distinguishable value each
+    // time and advancing `position` -- no re-capture between steps.
+    for step in 0..N_STEPS {
+        let value = step as f32 + 1.;
+        let k = Tensor::full(value, (1, N_HEADS, 1, HEAD_DIM), &device)?;
+        let v = Tensor::full(-value, (1, N_HEADS, 1, HEAD_DIM), &device)?;
+        let position = Tensor::new(&[step], &device)?;
+        graph.replay(Inputs { k, v, position })?;
+    }
+
+    // `current_data()`/`current_seq_len()` aren't tracked by `append_at` (see
+    // its docs), so read the raw backing buffer and check each replay landed
+    // in its own slot instead of all landing on slot 0.
+    let k_all = cache
+        .k_cache()
+        .all_data()
+        .as_ref()
+        .expect("append_at should have allocated the backing buffer")
+        .to_vec4::<f32>()?;
+    for step in 0..N_STEPS as usize {
+        let expected = step as f32 + 1.;
+        let got = k_all[0][0][step][0];
+        assert_eq!(
+            got, expected,
+            "slot {step}: expected {expected} (this step's value), got {got} -- \
+             if this were `expected` for step 0 on every slot, the write position \
+             would still be pinned at capture time instead of tracking replays"
+        );
+    }
+    println!("{N_STEPS} decode steps, each replay landed in its own cache slot: ok");
+
+    Ok(())
+}

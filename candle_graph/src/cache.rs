@@ -76,6 +76,33 @@ impl Cache {
         self.current_seq_len += seq_len;
         Ok(())
     }
+
+    /// Like [`append`](Self::append), except the write position on `dim` is read from
+    /// `position` (a `U32` tensor holding one element) at kernel-launch time instead of from
+    /// `self.current_seq_len`.
+    ///
+    /// `append` bakes `self.current_seq_len` into the write as a plain kernel-launch argument,
+    /// so a graph that captures it can only ever write to that one position on every replay --
+    /// there is no Rust code re-run on replay to advance it. Reading the position from a device
+    /// tensor instead means only the *pointer* is captured; updating `position`'s contents
+    /// between replays (e.g. via [`copy_inplace`](crate::graph::copy_inplace)) advances where
+    /// the next replay writes.
+    ///
+    /// This does not read, advance, or bounds-check `self.current_seq_len` -- there is no
+    /// Rust-side call between replays to do that against. Tracking the decode position and
+    /// keeping it within `max_seq_len` (chosen in [`new`](Self::new)) is the caller's
+    /// responsibility. `current_data`/`current_seq_len` are not meaningful for a cache driven
+    /// through `append_at`; read `all_data()` directly instead.
+    pub fn append_at(&mut self, src: &Tensor, position: &Tensor) -> Result<()> {
+        if self.all_data.is_none() {
+            let mut shape = src.dims().to_vec();
+            shape[self.dim] = self.max_seq_len;
+            let ad = Tensor::zeros(shape, src.dtype(), src.device())?;
+            self.all_data = Some(ad)
+        };
+        let ad = self.all_data.as_ref().unwrap();
+        ad.slice_set_fingerprinted_at(src, self.dim, 0, position)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -146,5 +173,21 @@ impl KvCache {
     pub fn reset(&mut self) {
         self.k.reset();
         self.v.reset();
+    }
+
+    /// Like [`append`](Self::append), except the write position is read from `position` at
+    /// kernel-launch time -- see [`Cache::append_at`]. This is what makes a graph capturing a
+    /// decode step replayable at a different position each time, without re-capturing.
+    ///
+    /// Returns nothing: unlike `append`, there is no meaningful `current_data()` to hand back
+    /// (see `append_at`'s docs on why `current_seq_len` isn't tracked here). Reading the
+    /// attention context back out for a growing sequence across replays -- as opposed to just
+    /// writing the new step in -- needs the read side (e.g. `narrow`) to also take a
+    /// device-resident length, which this PR does not add; see the `decode_replay` example for
+    /// where that would plug in.
+    pub fn append_at(&mut self, k: &Tensor, v: &Tensor, position: &Tensor) -> Result<()> {
+        self.k.append_at(k, position)?;
+        self.v.append_at(v, position)?;
+        Ok(())
     }
 }
