@@ -43,6 +43,12 @@ pub unsafe fn copy_inplace(src: &Tensor, dst: &Tensor, device: &Device) -> anyho
         "Devices must match!"
     );
 
+    let cu_device = match device {
+        Device::Cuda(dev) => dev,
+        _ => anyhow::bail!("copy_inplace requires a CUDA device"),
+    };
+    let stream = cu_device.cuda_stream();
+
     match (&*src.storage_and_layout().0, &*dst.storage_and_layout().0) {
         (Storage::Cuda(src), Storage::Cuda(tgt)) => {
             // What we are really doing:
@@ -55,14 +61,19 @@ pub unsafe fn copy_inplace(src: &Tensor, dst: &Tensor, device: &Device) -> anyho
             // let dst = unsafe { cast_to_mut(tgt.as_cuda_slice::<bf16>()?) };
             // cu_device.dtod_copy(src, dst)?;
 
+            // Uses `stream` (the device's own canonical stream, the same one Graph
+            // captures/replays on) for both device_ptr() calls and the copy itself,
+            // matching how CudaStream::memcpy_dtod's own reference implementation
+            // does it -- not each CudaSlice's own tracked allocation stream, which
+            // device_ptr() would otherwise use to decide what to cross-stream-wait on.
             fn memcpy_dtod<T: candle_core::WithDType + CudaDType>(
                 tgt: &candle_core::cuda::CudaStorage,
                 src: &candle_core::cuda::CudaStorage,
+                stream: &Arc<CudaStream>,
             ) -> anyhow::Result<()> {
                 let tgt = tgt.as_cuda_slice::<T>()?;
                 let src = src.as_cuda_slice::<T>()?;
                 let num_bytes = src.num_bytes();
-                let stream = tgt.stream();
 
                 let (tgt, _tgt_guard) = tgt.device_ptr(stream);
                 let (src, _src_guard) = src.device_ptr(stream);
@@ -73,13 +84,13 @@ pub unsafe fn copy_inplace(src: &Tensor, dst: &Tensor, device: &Device) -> anyho
             }
 
             match src.dtype() {
-                DType::BF16 => memcpy_dtod::<bf16>(tgt, src)?,
-                DType::F16 => memcpy_dtod::<f16>(tgt, src)?,
-                DType::F32 => memcpy_dtod::<f32>(tgt, src)?,
-                DType::F64 => memcpy_dtod::<f64>(tgt, src)?,
-                DType::I64 => memcpy_dtod::<i64>(tgt, src)?,
-                DType::U32 => memcpy_dtod::<u32>(tgt, src)?,
-                DType::U8 => memcpy_dtod::<u8>(tgt, src)?,
+                DType::BF16 => memcpy_dtod::<bf16>(tgt, src, &stream)?,
+                DType::F16 => memcpy_dtod::<f16>(tgt, src, &stream)?,
+                DType::F32 => memcpy_dtod::<f32>(tgt, src, &stream)?,
+                DType::F64 => memcpy_dtod::<f64>(tgt, src, &stream)?,
+                DType::I64 => memcpy_dtod::<i64>(tgt, src, &stream)?,
+                DType::U32 => memcpy_dtod::<u32>(tgt, src, &stream)?,
+                DType::U8 => memcpy_dtod::<u8>(tgt, src, &stream)?,
                 dtype => anyhow::bail!("copy_inplace: unsupported dtype {dtype:?}"),
             }
             device.synchronize()?;
