@@ -25,7 +25,7 @@ use std::{
     ptr,
 };
 
-use crate::{KernelLaunchParams, Node, NodeData, COPY2D_FINGERPRINT};
+use crate::{CudaTensorExtension, KernelLaunchParams, Node, NodeData, COPY2D_FINGERPRINT};
 
 /// Copy a tensor inplace from src to dst. This can be used to implement `GraphInput`.
 ///
@@ -247,6 +247,21 @@ impl<T: GraphInput> Graph<T> {
 
             // Unary
             let _ = x.neg()?;
+
+            // UPDATE_KV (this crate's own copy2d/copy2d_dynoffset kernels, used by
+            // Cache::append/append_at via CudaTensorExtension) -- must be warmed up here
+            // too, for the same reason as the built-ins above: this may be the first time
+            // this process has touched this particular CudaDevice, and load_ptx can't
+            // happen once capture starts. Without this, a closure whose first-ever call
+            // to slice_set_fingerprinted[_at] happens during capture silently captures a
+            // kernel node that doesn't write correctly on replay.
+            {
+                let dst = Tensor::zeros((1, 1), DType::F32, device)?;
+                let src = Tensor::zeros((1, 1), DType::F32, device)?;
+                dst.slice_set_fingerprinted(&src, 0, 0)?;
+                let position = Tensor::new(&[0u32], device)?;
+                dst.slice_set_fingerprinted_at(&src, 0, 0, &position)?;
+            }
 
             device.synchronize()?;
         }
