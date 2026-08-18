@@ -63,16 +63,18 @@ fn main() -> anyhow::Result<()> {
         .all_data()
         .as_ref()
         .expect("append_at should have allocated the backing buffer")
-        .to_vec4::<f32>()?;
+        .clone();
     for step in 0..N_STEPS as usize {
         let expected = step as f32 + 1.;
-        let got = k_all[0][0][step][0];
-        assert_eq!(
-            got, expected,
-            "slot {step}: expected {expected} (this step's value), got {got} -- \
-             if this were `expected` for step 0 on every slot, the write position \
-             would still be pinned at capture time instead of tracking replays"
-        );
+        // Every head and head_dim of this slot should hold this step's value.
+        for got in k_all.narrow(2, step, 1)?.flatten_all()?.to_vec1::<f32>()? {
+            assert_eq!(
+                got, expected,
+                "slot {step}: expected {expected} (this step's value), got {got} -- \
+                 if this were `expected` for step 0 on every slot, the write position \
+                 would still be pinned at capture time instead of tracking replays"
+            );
+        }
     }
     println!("{N_STEPS} decode steps, each replay landed in its own cache slot: ok");
 
