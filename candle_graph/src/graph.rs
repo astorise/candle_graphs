@@ -80,6 +80,7 @@ pub unsafe fn copy_inplace(src: &Tensor, dst: &Tensor, device: &Device) -> anyho
                 DType::I64 => memcpy_dtod::<i64>(tgt, src)?,
                 DType::U32 => memcpy_dtod::<u32>(tgt, src)?,
                 DType::U8 => memcpy_dtod::<u8>(tgt, src)?,
+                dtype => anyhow::bail!("copy_inplace: unsupported dtype {dtype:?}"),
             }
             device.synchronize()?;
         }

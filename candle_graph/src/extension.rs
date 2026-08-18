@@ -141,7 +141,8 @@ impl CudaStorageExtension for Tensor {
             (S::F64(_), S::F64(_)) => "copy2d_f64",
             _ => Err(CudaError::InternalError("dtype mismatch in copy2d"))?,
         };
-        let func = dev.get_or_load_func(kname, kernels::UPDATE_KV)?;
+        let func =
+            dev.get_or_load_custom_func(kname, "candle_graph_update_kv", kernels::UPDATE_KV)?;
         let cfg = LaunchConfig::for_num_elems(d1 * d2);
         let mut builder = func.builder();
         builder_arg!(builder, COPY2D_FINGERPRINT);
