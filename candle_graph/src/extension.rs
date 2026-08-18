@@ -422,7 +422,7 @@ mod test {
     /// re-capturing), and asserts each replay landed in its own slot -- i.e.
     /// that the write position tracks graph *replay* time, not capture time.
     #[test]
-    fn slice_set_at_survives_graph_replay() -> Result<()> {
+    fn slice_set_at_survives_graph_replay() -> anyhow::Result<()> {
         struct Inputs {
             x: Tensor,
             position: Tensor,
