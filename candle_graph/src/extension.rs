@@ -39,6 +39,7 @@ trait CudaStorageExtension {
         dst_o_base: usize,
         dst_o_stride: usize,
         dst_o_ptr: &CudaStorage,
+        dst_o_ptr_offset: usize,
     ) -> Result<()>;
 }
 
@@ -204,6 +205,10 @@ impl CudaTensorExtension for Tensor {
         let d2 = block_size * src.dims()[dim];
         let dst_o_base = self.layout().start_offset() + offset * block_size;
         let src_o = src.layout().start_offset();
+        // `position` may be a view into a larger buffer -- `positions.narrow(0, i, 1)` is
+        // contiguous and holds one element, so it passes the checks above while its element
+        // lives at `start_offset`, not at the start of the storage.
+        let position_o = position.layout().start_offset();
         match (
             &*self.storage_and_layout().0,
             &*src.storage_and_layout().0,
@@ -221,6 +226,7 @@ impl CudaTensorExtension for Tensor {
                     dst_o_base,
                     block_size,
                     position,
+                    position_o,
                 ),
             _ => Err(Error::DeviceMismatchBinaryOp {
                 lhs: self.device().location(),
@@ -295,6 +301,7 @@ impl CudaStorageExtension for Tensor {
         dst_o_base: usize,
         dst_o_stride: usize,
         dst_o_ptr: &CudaStorage,
+        dst_o_ptr_offset: usize,
     ) -> Result<()> {
         let dev = &src.device;
         let d1 = d1 as u32;
@@ -310,8 +317,11 @@ impl CudaStorageExtension for Tensor {
         let dst_o_stride = dst_o_stride as u32;
         // `slice_set_fingerprinted_at` already checked `position.dtype() == DType::U32` before
         // calling here; this match is exhaustive-by-construction, not a runtime dtype guard.
+        // The pointer is advanced to the view's own element: the storage pointer alone would
+        // make the kernel read element 0 of the underlying buffer, which is the wrong slot for
+        // any `position` that is a view (e.g. `positions.narrow(0, i, 1)`).
         let position_ptr = match &dst_o_ptr.slice {
-            S::U32(p) => *p.device_ptr(),
+            S::U32(p) => *p.device_ptr() + (dst_o_ptr_offset * std::mem::size_of::<u32>()) as u64,
             _ => Err(CudaError::InternalError(
                 "slice-set-at: position storage must be U32",
             ))?,
@@ -409,6 +419,37 @@ mod test {
                 .sum_all()?
                 .to_vec0::<f32>()?;
             assert_eq!(diff, 0., "slot {other} should still be zero");
+        }
+        Ok(())
+    }
+
+    /// `position` is allowed to be a view: a `narrow` of a positions buffer is contiguous and
+    /// holds one element, so it passes every check, but its element sits at the view's
+    /// `start_offset` rather than at the start of the storage. Reading the storage pointer
+    /// alone would make the kernel use `positions[0]` -- here 5 -- and write to the wrong slot.
+    #[test]
+    fn slice_set_at_honors_position_view_offset() -> Result<()> {
+        let device = Device::new_cuda_with_stream(0)?;
+
+        let (b, h, max_t, d) = (1, 1, 7, 3);
+        let cache = Tensor::zeros((b, h, max_t, d), DType::F32, &device)?;
+        let tensor = Tensor::ones((b, h, 1, d), DType::F32, &device)?;
+
+        // Element 0 is a decoy: if the offset is ignored, the write lands on slot 5.
+        let positions = Tensor::new(&[5u32, 2], &device)?;
+        let position = positions.narrow(0, 1, 1)?;
+        assert_eq!(position.layout().start_offset(), 1);
+
+        cache.slice_set_fingerprinted_at(&tensor, 2, 0, &position)?;
+
+        for slot in 0usize..max_t {
+            let sum = cache
+                .narrow(2, slot, 1)?
+                .abs()?
+                .sum_all()?
+                .to_vec0::<f32>()?;
+            let expected = if slot == 2 { d as f32 } else { 0. };
+            assert_eq!(sum, expected, "slot {slot}: write landed in the wrong slot");
         }
         Ok(())
     }

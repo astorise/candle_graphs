@@ -61,6 +61,10 @@ impl Cache {
     /// allocation's zero-fill gets captured along with the write, so *every* replay re-zeroes the
     /// whole cache and only the most recently written slot survives. Call this before capturing.
     pub fn reserve(&mut self, like: &Tensor) -> Result<()> {
+        // Indexing `shape[self.dim]` below would panic on an out-of-range `dim` rather than
+        // returning an error; `dim` validates it the way `append` already did before delegating
+        // here. `append_at` reaches this without a check of its own.
+        let _ = like.dim(self.dim)?;
         // This doesn't seem very idiomatic but because the creation can fail, it's tricky to use
         // self.all_data.get_or_insert_with.
         if self.all_data.is_none() {
