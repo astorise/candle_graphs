@@ -53,16 +53,28 @@ impl Cache {
         self.all_data = None;
     }
 
-    pub fn append(&mut self, src: &Tensor) -> Result<()> {
-        let seq_len = src.dim(self.dim)?;
+    /// Allocates the backing buffer now, if it isn't allocated yet, taking its dtype, device and
+    /// non-`dim` sizes from `like` (`dim` itself is sized to `max_seq_len`).
+    ///
+    /// [`append`](Self::append) and [`append_at`](Self::append_at) do this lazily on their first
+    /// call, which is a problem when that first call happens inside a graph capture: the
+    /// allocation's zero-fill gets captured along with the write, so *every* replay re-zeroes the
+    /// whole cache and only the most recently written slot survives. Call this before capturing.
+    pub fn reserve(&mut self, like: &Tensor) -> Result<()> {
         // This doesn't seem very idiomatic but because the creation can fail, it's tricky to use
         // self.all_data.get_or_insert_with.
         if self.all_data.is_none() {
-            let mut shape = src.dims().to_vec();
+            let mut shape = like.dims().to_vec();
             shape[self.dim] = self.max_seq_len;
-            let ad = Tensor::zeros(shape, src.dtype(), src.device())?;
+            let ad = Tensor::zeros(shape, like.dtype(), like.device())?;
             self.all_data = Some(ad)
         };
+        Ok(())
+    }
+
+    pub fn append(&mut self, src: &Tensor) -> Result<()> {
+        let seq_len = src.dim(self.dim)?;
+        self.reserve(src)?;
         let ad = self.all_data.as_mut().unwrap();
         if self.current_seq_len + seq_len > self.max_seq_len {
             candle_core::bail!(
@@ -93,13 +105,11 @@ impl Cache {
     /// keeping it within `max_seq_len` (chosen in [`new`](Self::new)) is the caller's
     /// responsibility. `current_data`/`current_seq_len` are not meaningful for a cache driven
     /// through `append_at`; read `all_data()` directly instead.
+    ///
+    /// Call [`reserve`](Self::reserve) before capturing if this would otherwise be the first
+    /// `append*` on the cache -- see its docs for why a capture-time allocation is a problem.
     pub fn append_at(&mut self, src: &Tensor, position: &Tensor) -> Result<()> {
-        if self.all_data.is_none() {
-            let mut shape = src.dims().to_vec();
-            shape[self.dim] = self.max_seq_len;
-            let ad = Tensor::zeros(shape, src.dtype(), src.device())?;
-            self.all_data = Some(ad)
-        };
+        self.reserve(src)?;
         let ad = self.all_data.as_ref().unwrap();
         ad.slice_set_fingerprinted_at(src, self.dim, 0, position)
     }
@@ -173,6 +183,14 @@ impl KvCache {
     pub fn reset(&mut self) {
         self.k.reset();
         self.v.reset();
+    }
+
+    /// Allocates both backing buffers now -- see [`Cache::reserve`]. Call this before capturing
+    /// a graph that appends to this cache, so the allocation isn't captured into it.
+    pub fn reserve(&mut self, k: &Tensor, v: &Tensor) -> Result<()> {
+        self.k.reserve(k)?;
+        self.v.reserve(v)?;
+        Ok(())
     }
 
     /// Like [`append`](Self::append), except the write position is read from `position` at

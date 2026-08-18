@@ -32,6 +32,11 @@ fn main() -> anyhow::Result<()> {
     let v = Tensor::zeros((1, N_HEADS, 1, HEAD_DIM), DType::F32, &device)?;
     let position = Tensor::new(&[0u32], &device)?;
 
+    // Allocate the cache before capturing: `append_at` would otherwise allocate on its first
+    // call -- which happens inside the closure below -- and the allocation's zero-fill would be
+    // captured into the graph, so every replay would wipe the cache before writing its slot.
+    cache.reserve(&k, &v)?;
+
     // Capture once: one decode step, writing at whatever `position` holds when
     // the graph runs -- not at a position fixed here during capture.
     let graph = Graph::new(
