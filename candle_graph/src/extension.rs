@@ -462,7 +462,9 @@ mod test {
         )?;
 
         for step in 0u32..3 {
-            let x = Tensor::full(step as f32 + 1., (b, h, 1, d), &device)?;
+            // `Tensor::full` broadcasts a 1-element storage, so it has to be materialized
+            // before `copy_inplace` (which memcpy's the raw storage) can use it.
+            let x = Tensor::full(step as f32 + 1., (b, h, 1, d), &device)?.contiguous()?;
             let position = Tensor::new(&[step], &device)?;
             graph.replay(Inputs { x, position })?;
 

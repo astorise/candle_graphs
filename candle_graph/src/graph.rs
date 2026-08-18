@@ -32,6 +32,30 @@ use crate::{CudaTensorExtension, KernelLaunchParams, Node, NodeData, COPY2D_FING
 /// # Safety
 /// It must be ensured that the storage of src can be cast to &mut. So no aliasing across threads.
 pub unsafe fn copy_inplace(src: &Tensor, dst: &Tensor, device: &Device) -> anyhow::Result<()> {
+    // The copy below is a flat memcpy of `src`'s *storage*, so a non-contiguous `src`
+    // (most commonly a broadcast one, e.g. `Tensor::full`, whose storage holds a single
+    // element regardless of its shape) would silently copy far fewer bytes than `dst`
+    // has, leaving the rest of `dst` at whatever it held before -- a wrong answer rather
+    // than an error. `GraphInput for HashMap` already rejects non-contiguous inputs for
+    // this reason; check here too so every caller gets the same guarantee.
+    anyhow::ensure!(
+        src.is_contiguous(),
+        "copy_inplace: src must be contiguous (got shape {:?}); \
+         call `.contiguous()` on it first",
+        src.shape()
+    );
+    anyhow::ensure!(
+        dst.is_contiguous(),
+        "copy_inplace: dst must be contiguous (got shape {:?})",
+        dst.shape()
+    );
+    anyhow::ensure!(
+        src.shape() == dst.shape(),
+        "copy_inplace: shape mismatch, src {:?} <> dst {:?}",
+        src.shape(),
+        dst.shape()
+    );
+
     match (&*src.storage_and_layout().0, &*dst.storage_and_layout().0) {
         (Storage::Cuda(src), Storage::Cuda(tgt)) => {
             // What we are really doing:

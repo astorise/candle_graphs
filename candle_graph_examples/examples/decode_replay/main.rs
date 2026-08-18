@@ -47,8 +47,10 @@ fn main() -> anyhow::Result<()> {
     // time and advancing `position` -- no re-capture between steps.
     for step in 0..N_STEPS {
         let value = step as f32 + 1.;
-        let k = Tensor::full(value, (1, N_HEADS, 1, HEAD_DIM), &device)?;
-        let v = Tensor::full(-value, (1, N_HEADS, 1, HEAD_DIM), &device)?;
+        // `.contiguous()`: `Tensor::full` broadcasts a 1-element storage, and graph inputs
+        // are copied in by a flat memcpy of that storage (see `copy_inplace`).
+        let k = Tensor::full(value, (1, N_HEADS, 1, HEAD_DIM), &device)?.contiguous()?;
+        let v = Tensor::full(-value, (1, N_HEADS, 1, HEAD_DIM), &device)?.contiguous()?;
         let position = Tensor::new(&[step], &device)?;
         graph.replay(Inputs { k, v, position })?;
     }
