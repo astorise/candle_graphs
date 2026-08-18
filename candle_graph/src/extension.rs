@@ -4,7 +4,7 @@ use candle_core::{
         CudaError, WrapErr, S,
     },
     shape::Dim,
-    CudaStorage, Error, Result, Storage, Tensor,
+    CudaStorage, DType, Error, Result, Storage, Tensor,
 };
 
 use crate::kernels;
