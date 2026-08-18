@@ -466,11 +466,12 @@ mod test {
             let position = Tensor::new(&[step], &device)?;
             graph.replay(Inputs { x, position })?;
 
-            let written = cache.narrow(2, step as usize, 1)?.to_vec3::<f32>()?;
-            for row in &written[0] {
-                for &v in row {
-                    assert_eq!(v, step as f32 + 1., "slot {step} after replay {step}");
-                }
+            let written = cache
+                .narrow(2, step as usize, 1)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            for &v in &written {
+                assert_eq!(v, step as f32 + 1., "slot {step} after replay {step}");
             }
         }
 
@@ -479,14 +480,12 @@ mod test {
         // overwritten slot 0 instead of advancing.
         for slot in 0usize..2 {
             let expected = slot as f32 + 1.;
-            let got = cache.narrow(2, slot, 1)?.to_vec3::<f32>()?;
-            for row in &got[0] {
-                for &v in row {
-                    assert_eq!(
-                        v, expected,
-                        "slot {slot} must retain its own replay's value"
-                    );
-                }
+            let got = cache.narrow(2, slot, 1)?.flatten_all()?.to_vec1::<f32>()?;
+            for &v in &got {
+                assert_eq!(
+                    v, expected,
+                    "slot {slot} must retain its own replay's value"
+                );
             }
         }
 
