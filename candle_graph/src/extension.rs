@@ -134,6 +134,8 @@ impl CudaStorageExtension for Tensor {
         let kname = match (&src.slice, &dst.slice) {
             (S::U8(_), S::U8(_)) => "copy2d_u8",
             (S::U32(_), S::U32(_)) => "copy2d_u32",
+            (S::I16(_), S::I16(_)) => "copy2d_i16",
+            (S::I32(_), S::I32(_)) => "copy2d_i32",
             (S::I64(_), S::I64(_)) => "copy2d_i64",
             (S::BF16(_), S::BF16(_)) => "copy2d_bf16",
             (S::F16(_), S::F16(_)) => "copy2d_f16",
@@ -158,6 +160,14 @@ impl CudaStorageExtension for Tensor {
                 builder.arg(s);
                 builder.arg(d);
             }
+            (S::I16(s), S::I16(d)) => {
+                builder.arg(s);
+                builder.arg(d);
+            }
+            (S::I32(s), S::I32(d)) => {
+                builder.arg(s);
+                builder.arg(d);
+            }
             (S::I64(s), S::I64(d)) => {
                 builder.arg(s);
                 builder.arg(d);
@@ -178,7 +188,7 @@ impl CudaStorageExtension for Tensor {
                 builder.arg(s);
                 builder.arg(d);
             }
-            // Already validated as one of the 7 arms above when `kname` was picked.
+            // Already validated as one of the arms above when `kname` was picked.
             _ => unreachable!("dtype mismatch in copy2d"),
         }
         builder_arg!(builder, d1);

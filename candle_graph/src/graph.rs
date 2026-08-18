@@ -5,7 +5,7 @@ use candle_core::{
         cudarc::driver::{
             self, result,
             sys::{self, CUgraph, CUgraphDebugDot_flags, CUgraphExec, CUgraphNode},
-            CudaStream, DevicePtr, DriverError,
+            CudaContext, CudaStream, DevicePtr, DriverError,
         },
         CudaDType,
     },
@@ -88,9 +88,13 @@ pub unsafe fn copy_inplace(src: &Tensor, dst: &Tensor, device: &Device) -> anyho
                 DType::F16 => memcpy_dtod::<f16>(tgt, src, &stream)?,
                 DType::F32 => memcpy_dtod::<f32>(tgt, src, &stream)?,
                 DType::F64 => memcpy_dtod::<f64>(tgt, src, &stream)?,
+                DType::I16 => memcpy_dtod::<i16>(tgt, src, &stream)?,
+                DType::I32 => memcpy_dtod::<i32>(tgt, src, &stream)?,
                 DType::I64 => memcpy_dtod::<i64>(tgt, src, &stream)?,
                 DType::U32 => memcpy_dtod::<u32>(tgt, src, &stream)?,
                 DType::U8 => memcpy_dtod::<u8>(tgt, src, &stream)?,
+                // DType is #[non_exhaustive]; anything not listed above (the fp8 types today)
+                // fails loudly rather than silently leaving the input un-copied.
                 dtype => anyhow::bail!("copy_inplace: unsupported dtype {dtype:?}"),
             }
             device.synchronize()?;
@@ -129,6 +133,48 @@ fn end_capture(
 fn launch(stream: &Arc<CudaStream>, cu_graph_exec: CUgraphExec) -> Result<(), DriverError> {
     stream.context().bind_to_thread()?;
     unsafe { result::graph::launch(cu_graph_exec, stream.cu_stream()) }
+}
+
+/// Turns cudarc's per-slice event tracking off for as long as it is alive, then restores
+/// whatever the context had before.
+///
+/// cudarc >= 0.19 records/waits on a `CudaEvent` per `CudaSlice` around each kernel launch
+/// while [`CudaContext::is_managing_stream_synchronization`] holds (multi-stream mode, which
+/// `Device::new_cuda_with_stream` turns on, plus event tracking). Waiting on an event that was
+/// not recorded inside the graph being captured is not a legal capture operation, so capture
+/// fails with `CUDA_ERROR_INVALID_VALUE` unless tracking is off while it runs.
+///
+/// It is a context-wide setting, so this restores it on drop -- including on the error paths
+/// out of capture -- rather than leaving the caller's context permanently changed. Note that
+/// tensors *allocated inside* the captured closure are created while tracking is off and so
+/// carry no events; as with everything else this crate captures, they belong to the graph's
+/// stream.
+struct EventTrackingPause<'a> {
+    ctx: &'a Arc<CudaContext>,
+    restore: bool,
+}
+
+impl<'a> EventTrackingPause<'a> {
+    fn new(ctx: &'a Arc<CudaContext>) -> Self {
+        let restore = ctx.is_event_tracking();
+        if restore {
+            // SAFETY: the caller takes over cross-stream synchronization. Everything this
+            // crate does is confined to one stream -- capture, replay and `copy_inplace` all
+            // use the device's own stream, and `replay` synchronizes the device afterwards --
+            // so there is no second stream to race against for the duration of the pause.
+            unsafe { ctx.disable_event_tracking() };
+        }
+        Self { ctx, restore }
+    }
+}
+
+impl Drop for EventTrackingPause<'_> {
+    fn drop(&mut self) {
+        if self.restore {
+            // SAFETY: restoring the context's own previous setting.
+            unsafe { self.ctx.enable_event_tracking() };
+        }
+    }
 }
 
 pub enum GraphDumpFormat {
@@ -203,25 +249,6 @@ impl<T: GraphInput> Graph<T> {
             _ => anyhow::bail!("Must have CUDA device."),
         };
 
-        // cudarc >= 0.19 tracks every CudaSlice's reads/writes with CUDA events, and
-        // records/waits on them around each kernel launch whenever the context is in
-        // multi-stream mode -- which `Device::new_cuda_with_stream` puts it in, since
-        // `CudaContext::new_stream()` is what flips that flag. Waiting on an event that
-        // was not recorded inside the graph being captured is not a legal capture
-        // operation, so with tracking left on, capture fails outright
-        // (CUDA_ERROR_INVALID_VALUE). candle-core exposes `disable_event_tracking` for
-        // exactly this case; the guard on the launch path re-reads the flag each time,
-        // so this also covers tensors that were created before this call.
-        //
-        // SAFETY: the caller must then ensure cross-stream synchronization by hand.
-        // Everything here is confined to this one device stream -- capture, replay, and
-        // `copy_inplace` all go through `cu_device.cuda_stream()` -- and `replay`
-        // synchronizes the device after each launch, so there is no second stream to
-        // race against.
-        if cu_device.is_event_tracking() {
-            unsafe { cu_device.disable_event_tracking() };
-        }
-
         let stream = cu_device.cuda_stream();
 
         // Initialize all ptx files
@@ -283,18 +310,25 @@ impl<T: GraphInput> Graph<T> {
             device.synchronize()?;
         }
 
-        begin_capture(
-            &stream,
-            sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED,
-        )?;
+        // Scoped to the capture only: see `EventTrackingPause`. Restored on drop, so the
+        // caller's context keeps whatever setting it had once `Graph::new` returns -- on the
+        // error paths out of `from_code`/`end_capture` too.
+        let (cu_graph, cu_graph_exec) = {
+            let _event_tracking = EventTrackingPause::new(stream.context());
 
-        from_code(&input)?;
+            begin_capture(
+                &stream,
+                sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED,
+            )?;
 
-        let (cu_graph, cu_graph_exec) = end_capture(
-            &stream,
-            sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
-        )?
-        .context("`end_capture` failed.")?;
+            from_code(&input)?;
+
+            end_capture(
+                &stream,
+                sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
+            )?
+            .context("`end_capture` failed.")?
+        };
 
         for (name, input) in &input.to_inputs() {
             if !input.is_contiguous() {
