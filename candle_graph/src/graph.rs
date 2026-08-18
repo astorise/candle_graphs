@@ -16,14 +16,14 @@ use candle_nn::Module;
 use half::{bf16, f16};
 use std::{
     cell::Cell,
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     ffi::CString,
     marker::PhantomData,
     mem::MaybeUninit,
     path::Path,
     process::Command,
     ptr,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use crate::{KernelLaunchParams, Node, NodeData, COPY2D_FINGERPRINT};
@@ -149,30 +149,70 @@ fn launch(stream: &Arc<CudaStream>, cu_graph_exec: CUgraphExec) -> Result<(), Dr
 /// tensors *allocated inside* the captured closure are created while tracking is off and so
 /// carry no events; as with everything else this crate captures, they belong to the graph's
 /// stream.
+///
+/// Pauses nest, because the setting is one flag shared by every stream on the context: if two
+/// captures overlap, comparing against the live flag would make the second pause read "already
+/// off", record nothing to restore, and let the first one switch tracking back on mid-capture.
+/// Instead the pauses are reference counted per context -- the first turns tracking off and
+/// remembers the original value, the last puts that value back.
+struct PauseState {
+    depth: usize,
+    restore: bool,
+}
+
+/// Keyed by context (`Arc::as_ptr`), since the flag lives on the context: pausing one device's
+/// context must not hold another's paused.
+static EVENT_TRACKING_PAUSES: Mutex<BTreeMap<usize, PauseState>> = Mutex::new(BTreeMap::new());
+
 struct EventTrackingPause<'a> {
     ctx: &'a Arc<CudaContext>,
-    restore: bool,
 }
 
 impl<'a> EventTrackingPause<'a> {
     fn new(ctx: &'a Arc<CudaContext>) -> Self {
-        let restore = ctx.is_event_tracking();
-        if restore {
-            // SAFETY: the caller takes over cross-stream synchronization. Everything this
-            // crate does is confined to one stream -- capture, replay and `copy_inplace` all
-            // use the device's own stream, and `replay` synchronizes the device afterwards --
-            // so there is no second stream to race against for the duration of the pause.
-            unsafe { ctx.disable_event_tracking() };
+        // A poisoned lock only means some other thread panicked while holding it; the counter
+        // itself is still consistent, so keep going rather than cascading the panic.
+        let mut pauses = EVENT_TRACKING_PAUSES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let state = pauses
+            .entry(Arc::as_ptr(ctx) as usize)
+            .or_insert(PauseState {
+                depth: 0,
+                restore: false,
+            });
+        if state.depth == 0 {
+            state.restore = ctx.is_event_tracking();
+            if state.restore {
+                // SAFETY: the caller takes over cross-stream synchronization. Everything this
+                // crate does is confined to one stream -- capture, replay and `copy_inplace`
+                // all use the device's own stream, and `replay` synchronizes the device
+                // afterwards -- so there is no second stream of ours to race against.
+                unsafe { ctx.disable_event_tracking() };
+            }
         }
-        Self { ctx, restore }
+        state.depth += 1;
+        Self { ctx }
     }
 }
 
 impl Drop for EventTrackingPause<'_> {
     fn drop(&mut self) {
-        if self.restore {
-            // SAFETY: restoring the context's own previous setting.
-            unsafe { self.ctx.enable_event_tracking() };
+        let key = Arc::as_ptr(self.ctx) as usize;
+        let mut pauses = EVENT_TRACKING_PAUSES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(state) = pauses.get_mut(&key) else {
+            return;
+        };
+        state.depth -= 1;
+        if state.depth == 0 {
+            if state.restore {
+                // SAFETY: restoring the context's own previous setting, and this is the last
+                // pause standing on it.
+                unsafe { self.ctx.enable_event_tracking() };
+            }
+            pauses.remove(&key);
         }
     }
 }
