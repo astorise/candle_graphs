@@ -203,6 +203,25 @@ impl<T: GraphInput> Graph<T> {
             _ => anyhow::bail!("Must have CUDA device."),
         };
 
+        // cudarc >= 0.19 tracks every CudaSlice's reads/writes with CUDA events, and
+        // records/waits on them around each kernel launch whenever the context is in
+        // multi-stream mode -- which `Device::new_cuda_with_stream` puts it in, since
+        // `CudaContext::new_stream()` is what flips that flag. Waiting on an event that
+        // was not recorded inside the graph being captured is not a legal capture
+        // operation, so with tracking left on, capture fails outright
+        // (CUDA_ERROR_INVALID_VALUE). candle-core exposes `disable_event_tracking` for
+        // exactly this case; the guard on the launch path re-reads the flag each time,
+        // so this also covers tensors that were created before this call.
+        //
+        // SAFETY: the caller must then ensure cross-stream synchronization by hand.
+        // Everything here is confined to this one device stream -- capture, replay, and
+        // `copy_inplace` all go through `cu_device.cuda_stream()` -- and `replay`
+        // synchronizes the device after each launch, so there is no second stream to
+        // race against.
+        if cu_device.is_event_tracking() {
+            unsafe { cu_device.disable_event_tracking() };
+        }
+
         let stream = cu_device.cuda_stream();
 
         // Initialize all ptx files
