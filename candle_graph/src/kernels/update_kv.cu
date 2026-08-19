@@ -46,10 +46,18 @@ __device__ void copy2d_dynoffset(
   uint32_t src_s, uint32_t dst_s,
   const uint32_t *dst_o_ptr, uint32_t dst_o_ptr_max
 ) {
-  // Uniform across the launch, so an out-of-range position drops the copy whole
-  // rather than clipping it: a partially written slot would leave the
-  // destination in a state the caller has no way to reason about.
-  if (*dst_o_ptr > dst_o_ptr_max) {
+  // Read once, then check and use that same value. Nothing stops `dst_o_ptr`
+  // from aliasing a slot this very launch writes, and re-reading it for the
+  // offset would let a neighbour's write land between the check and its use --
+  // the bound would then be enforced against a position that is no longer the
+  // one written at. One load per thread means each thread writes only where it
+  // checked: an aliasing caller still gets garbage, but in bounds.
+  const uint32_t position = *dst_o_ptr;
+  // The whole copy is dropped rather than clipped -- a partially written slot
+  // would leave the destination in a state the caller has no way to reason
+  // about. Barring that aliasing case, every thread loads the same position, so
+  // this is uniform and the launch drops as one.
+  if (position > dst_o_ptr_max) {
     return;
   }
   uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -58,7 +66,7 @@ __device__ void copy2d_dynoffset(
   }
   uint32_t idx1 = idx / d2;
   uint32_t idx2 = idx - d2 * idx1;
-  uint32_t dst_o = dst_o_base + (*dst_o_ptr) * dst_o_stride;
+  uint32_t dst_o = dst_o_base + position * dst_o_stride;
   (dst + dst_o)[idx1 * dst_s + idx2] = (src + src_o)[idx1 * src_s + idx2];
 }
 
