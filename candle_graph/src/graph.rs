@@ -9,8 +9,9 @@ use candle_core::{
         },
         DevicePtr, DeviceSlice,
     },
+    cuda::CudaDType,
     quantized::{GgmlDType, QMatMul, QTensor},
-    DType, Device, Storage, Tensor,
+    CudaStorage, DType, Device, Storage, Tensor,
 };
 use candle_nn::Module;
 use half::{bf16, f16};
@@ -27,17 +28,46 @@ use std::{
 
 use crate::{CudaTensorExtension, KernelLaunchParams, Node, NodeData, COPY2D_FINGERPRINT};
 
+/// `count` elements of one dtype, from `src`'s storage at `src_o` to `dst`'s at `dst_o`.
+///
+/// # Safety
+/// Same contract as [`copy_inplace`]: `dst`'s storage is written through a shared reference, so
+/// it must not be aliased mutably elsewhere.
+unsafe fn memcpy_dtod<T: CudaDType>(
+    src: &CudaStorage,
+    src_o: usize,
+    dst: &CudaStorage,
+    dst_o: usize,
+    count: usize,
+) -> anyhow::Result<()> {
+    let src = src.as_cuda_slice::<T>()?;
+    let dst = dst.as_cuda_slice::<T>()?;
+    anyhow::ensure!(
+        src_o + count <= src.len() && dst_o + count <= dst.len(),
+        "copy_inplace: {count} elements at offsets {src_o}/{dst_o} do not fit in storages of \
+         {}/{} elements",
+        src.len(),
+        dst.len()
+    );
+    let elem = std::mem::size_of::<T>();
+    driver::result::memcpy_dtod_sync(
+        *dst.device_ptr() + (dst_o * elem) as u64,
+        *src.device_ptr() + (src_o * elem) as u64,
+        count * elem,
+    )?;
+    Ok(())
+}
+
 /// Copy a tensor inplace from src to dst. This can be used to implement `GraphInput`.
 ///
 /// # Safety
 /// It must be ensured that the storage of src can be cast to &mut. So no aliasing across threads.
 pub unsafe fn copy_inplace(src: &Tensor, dst: &Tensor, device: &Device) -> anyhow::Result<()> {
-    // The copy below is a flat memcpy of `src`'s *storage*, so a non-contiguous `src`
-    // (most commonly a broadcast one, e.g. `Tensor::full`, whose storage holds a single
-    // element regardless of its shape) would silently copy far fewer bytes than `dst`
-    // has, leaving the rest of `dst` at whatever it held before -- a wrong answer rather
-    // than an error. `GraphInput for HashMap` already rejects non-contiguous inputs for
-    // this reason; check here too so every caller gets the same guarantee.
+    // The copy below is a flat memcpy, so a non-contiguous `src` (most commonly a broadcast
+    // one, e.g. `Tensor::full`, whose storage holds a single element regardless of its shape)
+    // has no run of `elem_count()` elements to copy from in the first place. `GraphInput for
+    // HashMap` already rejects non-contiguous inputs for this reason; check here too so every
+    // caller gets the same guarantee, and a clearer message than the storage-bounds check.
     anyhow::ensure!(
         src.is_contiguous(),
         "copy_inplace: src must be contiguous (got shape {:?}); \
@@ -56,7 +86,20 @@ pub unsafe fn copy_inplace(src: &Tensor, dst: &Tensor, device: &Device) -> anyho
         dst.shape()
     );
 
-    match (&*src.storage_and_layout().0, &*dst.storage_and_layout().0) {
+    // `CudaStorage` is the whole allocation, not this tensor's view of it, so the offsets and
+    // the element count have to come from the layouts. A contiguous *view* -- the
+    // `positions.narrow(0, i, 1)` that `Cache::append_at` is meant to be driven with -- shares
+    // its storage with the buffer it was carved from, so copying from the storage's base
+    // pointer for the storage's full length would read the wrong element and write past the end
+    // of a destination whose own storage is smaller.
+    let (src_storage, src_layout) = src.storage_and_layout();
+    let (dst_storage, dst_layout) = dst.storage_and_layout();
+    let src_o = src_layout.start_offset();
+    let dst_o = dst_layout.start_offset();
+    // Both shapes were checked equal above, so either count works.
+    let count = src_layout.shape().elem_count();
+
+    match (&*src_storage, &*dst_storage) {
         (Storage::Cuda(src), Storage::Cuda(tgt)) => {
             // What we are really doing:
 
@@ -68,72 +111,16 @@ pub unsafe fn copy_inplace(src: &Tensor, dst: &Tensor, device: &Device) -> anyho
             // let dst = unsafe { cast_to_mut(tgt.as_cuda_slice::<bf16>()?) };
             // cu_device.dtod_copy(src, dst)?;
 
-            anyhow::ensure!(src.dtype() == dst.dtype(), "DTypes must match!");
+            anyhow::ensure!(src.dtype() == tgt.dtype(), "DTypes must match!");
 
             match src.dtype() {
-                DType::BF16 => {
-                    let tgt = tgt.as_cuda_slice::<bf16>()?;
-                    let src = src.as_cuda_slice::<bf16>()?;
-                    driver::result::memcpy_dtod_sync(
-                        *tgt.device_ptr(),
-                        *src.device_ptr(),
-                        src.len() * std::mem::size_of::<bf16>(),
-                    )?;
-                }
-                DType::F16 => {
-                    let tgt = tgt.as_cuda_slice::<f16>()?;
-                    let src = src.as_cuda_slice::<f16>()?;
-                    driver::result::memcpy_dtod_sync(
-                        *tgt.device_ptr(),
-                        *src.device_ptr(),
-                        src.len() * std::mem::size_of::<f16>(),
-                    )?;
-                }
-                DType::F32 => {
-                    let tgt = tgt.as_cuda_slice::<f32>()?;
-                    let src = src.as_cuda_slice::<f32>()?;
-                    driver::result::memcpy_dtod_sync(
-                        *tgt.device_ptr(),
-                        *src.device_ptr(),
-                        src.len() * std::mem::size_of::<f32>(),
-                    )?;
-                }
-                DType::F64 => {
-                    let tgt = tgt.as_cuda_slice::<f64>()?;
-                    let src = src.as_cuda_slice::<f64>()?;
-                    driver::result::memcpy_dtod_sync(
-                        *tgt.device_ptr(),
-                        *src.device_ptr(),
-                        src.len() * std::mem::size_of::<f64>(),
-                    )?;
-                }
-                DType::I64 => {
-                    let tgt = tgt.as_cuda_slice::<i64>()?;
-                    let src = src.as_cuda_slice::<i64>()?;
-                    driver::result::memcpy_dtod_sync(
-                        *tgt.device_ptr(),
-                        *src.device_ptr(),
-                        src.len() * std::mem::size_of::<i64>(),
-                    )?;
-                }
-                DType::U32 => {
-                    let tgt = tgt.as_cuda_slice::<u32>()?;
-                    let src = src.as_cuda_slice::<u32>()?;
-                    driver::result::memcpy_dtod_sync(
-                        *tgt.device_ptr(),
-                        *src.device_ptr(),
-                        src.len() * std::mem::size_of::<u32>(),
-                    )?;
-                }
-                DType::U8 => {
-                    let tgt = tgt.as_cuda_slice::<u8>()?;
-                    let src = src.as_cuda_slice::<u8>()?;
-                    driver::result::memcpy_dtod_sync(
-                        *tgt.device_ptr(),
-                        *src.device_ptr(),
-                        src.len() * std::mem::size_of::<u8>(),
-                    )?;
-                }
+                DType::BF16 => memcpy_dtod::<bf16>(src, src_o, tgt, dst_o, count)?,
+                DType::F16 => memcpy_dtod::<f16>(src, src_o, tgt, dst_o, count)?,
+                DType::F32 => memcpy_dtod::<f32>(src, src_o, tgt, dst_o, count)?,
+                DType::F64 => memcpy_dtod::<f64>(src, src_o, tgt, dst_o, count)?,
+                DType::I64 => memcpy_dtod::<i64>(src, src_o, tgt, dst_o, count)?,
+                DType::U32 => memcpy_dtod::<u32>(src, src_o, tgt, dst_o, count)?,
+                DType::U8 => memcpy_dtod::<u8>(src, src_o, tgt, dst_o, count)?,
             }
             device.synchronize()?;
         }
@@ -279,12 +266,34 @@ impl<T: GraphInput> Graph<T> {
             // happen once capture starts. Without this, a closure whose first-ever call
             // to slice_set_fingerprinted[_at] happens during capture silently captures a
             // kernel node that doesn't write correctly on replay.
-            {
-                let dst = Tensor::zeros((1, 1), DType::F32, device)?;
-                let src = Tensor::zeros((1, 1), DType::F32, device)?;
-                dst.slice_set_fingerprinted(&src, 0, 0)?;
-                let position = Tensor::new(&[0u32], device)?;
-                dst.slice_set_fingerprinted_at(&src, 0, 0, &position)?;
+            //
+            // Every dtype, not just F32: `get_or_load_func` keys its module cache on the
+            // *function* name, and the launch path picks a different one per dtype
+            // (`copy2d_dynoffset_bf16` vs `..._f32`), so warming one leaves the others cold.
+            // A bf16 or f16 KV cache -- the usual case for decode -- would otherwise hit its
+            // first load inside the capture.
+            for dtype in [
+                DType::BF16,
+                DType::F16,
+                DType::F32,
+                DType::F64,
+                DType::I64,
+                DType::U32,
+                DType::U8,
+            ] {
+                // Deliberately not propagated: the f16 and bf16 kernels are compiled behind
+                // `__CUDA_ARCH__` guards, so on an older device they are absent from the PTX
+                // and this fails. That is not a reason to refuse to build a graph that never
+                // uses them -- and one that does will raise the same error at its own call,
+                // outside the capture.
+                let _ = (|| -> anyhow::Result<()> {
+                    let dst = Tensor::zeros((1, 1), dtype, device)?;
+                    let src = Tensor::zeros((1, 1), dtype, device)?;
+                    dst.slice_set_fingerprinted(&src, 0, 0)?;
+                    let position = Tensor::new(&[0u32], device)?;
+                    dst.slice_set_fingerprinted_at(&src, 0, 0, &position)?;
+                    Ok(())
+                })();
             }
 
             device.synchronize()?;
@@ -519,5 +528,39 @@ impl<T: GraphInput> Drop for Graph<T> {
         unsafe { driver::sys::lib().cuGraphExecDestroy(self.exec) }
             .result()
             .expect("Graph destroy failed");
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use candle_core::{DType, Device, Tensor};
+
+    use super::copy_inplace;
+
+    /// The memcpy addresses *storages*, not tensors. A contiguous view -- what `Cache::append_at`
+    /// is meant to be driven with, e.g. `positions.narrow(0, i, 1)` -- shares the storage of the
+    /// buffer it was carved from, so ignoring the layouts reads that buffer's first element and
+    /// writes its whole length, however small the destination's own allocation is.
+    #[test]
+    fn copy_inplace_honors_view_offsets() -> anyhow::Result<()> {
+        let device = Device::new_cuda_with_stream(0)?;
+
+        let positions = Tensor::new(&[10u32, 20, 30, 40], &device)?;
+        let src = positions.narrow(0, 2, 1)?;
+
+        // The destination is a view too: the write has to land on its element, not on the
+        // start of the buffer behind it.
+        let dst_buf = Tensor::zeros(4usize, DType::U32, &device)?;
+        let dst = dst_buf.narrow(0, 1, 1)?;
+        unsafe { copy_inplace(&src, &dst, &device)? };
+        assert_eq!(dst_buf.to_vec1::<u32>()?, [0, 30, 0, 0]);
+
+        // A destination whose entire storage is one element: copying the source's storage
+        // wholesale would write four elements into it.
+        let small = Tensor::zeros(1usize, DType::U32, &device)?;
+        unsafe { copy_inplace(&src, &small, &device)? };
+        assert_eq!(small.to_vec1::<u32>()?, [30]);
+
+        Ok(())
     }
 }
