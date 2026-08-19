@@ -262,6 +262,23 @@ impl CudaTensorExtension for Tensor {
     }
 }
 
+/// Narrows a host-side `usize` to the `uint32_t` the `copy2d_*` kernels take, refusing to
+/// truncate.
+///
+/// Every index the kernels use is 32-bit, while the checks that feed them are computed in
+/// `usize`. A destination too big to address in 32 bits -- a bf16 KV cache of about 8 GiB is
+/// already there -- would pass those checks and then have its offsets wrapped on the way to the
+/// kernel, writing into the wrong region of the cache. Widening the kernels to 64-bit indices is
+/// the other way out, and a larger change than this.
+fn to_u32(v: usize, what: &str) -> Result<u32> {
+    match u32::try_from(v) {
+        Ok(v) => Ok(v),
+        Err(_) => candle_core::bail!(
+            "slice-set-at: {what} ({v}) does not fit in u32; the copy2d kernels index in 32 bits"
+        ),
+    }
+}
+
 impl CudaStorageExtension for Tensor {
     fn copy2d_fingerprinted(
         &self,
@@ -329,18 +346,19 @@ impl CudaStorageExtension for Tensor {
         dst_o_ptr_max: usize,
     ) -> Result<()> {
         let dev = &src.device;
-        let d1 = d1 as u32;
-        let d2 = d2 as u32;
+        let d1 = to_u32(d1, "d1")?;
+        let d2 = to_u32(d2, "d2")?;
         // Nothing to copy so we exit early to avoid launching a kernel and some potential invalid
         // argument with a null pointer.
         if d1 == 0 || d2 == 0 {
             return Ok(());
         }
-        let dst_s = dst_s as u32;
-        let src_s = src_s as u32;
-        let dst_o_base = dst_o_base as u32;
-        let dst_o_stride = dst_o_stride as u32;
-        let dst_o_ptr_max = dst_o_ptr_max as u32;
+        let dst_s = to_u32(dst_s, "dst stride")?;
+        let src_s = to_u32(src_s, "src stride")?;
+        let src_o = to_u32(src_o, "src offset")?;
+        let dst_o_base = to_u32(dst_o_base, "dst base offset")?;
+        let dst_o_stride = to_u32(dst_o_stride, "dst position stride")?;
+        let dst_o_ptr_max = to_u32(dst_o_ptr_max, "max position")?;
         // `slice_set_fingerprinted_at` already checked `position.dtype() == DType::U32` before
         // calling here; this match is exhaustive-by-construction, not a runtime dtype guard.
         // The pointer is advanced to the view's own element: the storage pointer alone would

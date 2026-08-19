@@ -12,6 +12,10 @@ pub struct Cache {
     dim: usize,
     current_seq_len: usize,
     max_seq_len: usize,
+    /// Set by [`reserve`](Cache::reserve), which is the caller declaring this cache is about to
+    /// be captured into a graph. From then on the allocation may be baked into that graph as a
+    /// raw pointer, so [`reset`](Cache::reset) must not free it.
+    reserved: bool,
 }
 
 impl Cache {
@@ -21,6 +25,7 @@ impl Cache {
             dim,
             current_seq_len: 0,
             max_seq_len,
+            reserved: false,
         }
     }
 
@@ -48,9 +53,15 @@ impl Cache {
         Ok(data)
     }
 
+    /// Rewinds to an empty cache.
+    ///
+    /// Frees the backing buffer, unless [`reserve`](Self::reserve) was called -- see there. Drop
+    /// the `Cache` to release a reserved buffer.
     pub fn reset(&mut self) {
         self.current_seq_len = 0;
-        self.all_data = None;
+        if !self.reserved {
+            self.all_data = None;
+        }
     }
 
     /// Allocates the backing buffer now, if it isn't allocated yet, taking its dtype, device and
@@ -60,7 +71,25 @@ impl Cache {
     /// call, which is a problem when that first call happens inside a graph capture: the
     /// allocation's zero-fill gets captured along with the write, so *every* replay re-zeroes the
     /// whole cache and only the most recently written slot survives. Call this before capturing.
+    ///
+    /// This also pins the buffer: [`reset`](Self::reset) stops freeing it, because a graph that
+    /// captured a write to this cache keeps only the raw destination pointer and would go on
+    /// writing to the freed address. Drop the `Cache` to release the memory. A consequence is
+    /// that a reserved cache keeps its shape across `reset`, so appending a differently shaped
+    /// batch afterwards is an error rather than a silent reallocation.
     pub fn reserve(&mut self, like: &Tensor) -> Result<()> {
+        self.alloc(like)?;
+        // Calling this is the caller saying the buffer is about to be captured. A graph that
+        // captures a write to this cache holds nothing but the raw destination pointer -- there
+        // is no Rust code on the replay path to notice the tensor was dropped -- so from here on
+        // `reset` only rewinds the position instead of freeing the allocation out from under it.
+        self.reserved = true;
+        Ok(())
+    }
+
+    /// The allocation itself, without the [`reserve`](Self::reserve) pin: `append`/`append_at`
+    /// call this so that a cache only used outside a capture keeps `reset`'s freeing behaviour.
+    fn alloc(&mut self, like: &Tensor) -> Result<()> {
         // Indexing `shape[self.dim]` below would panic on an out-of-range `dim` rather than
         // returning an error; `dim` validates it the way `append` already did before delegating
         // here. `append_at` reaches this without a check of its own.
@@ -78,7 +107,7 @@ impl Cache {
 
     pub fn append(&mut self, src: &Tensor) -> Result<()> {
         let seq_len = src.dim(self.dim)?;
-        self.reserve(src)?;
+        self.alloc(src)?;
         let ad = self.all_data.as_mut().unwrap();
         if self.current_seq_len + seq_len > self.max_seq_len {
             candle_core::bail!(
@@ -118,7 +147,7 @@ impl Cache {
     /// Call [`reserve`](Self::reserve) before capturing if this would otherwise be the first
     /// `append*` on the cache -- see its docs for why a capture-time allocation is a problem.
     pub fn append_at(&mut self, src: &Tensor, position: &Tensor) -> Result<()> {
-        self.reserve(src)?;
+        self.alloc(src)?;
         let ad = self.all_data.as_ref().unwrap();
         ad.slice_set_fingerprinted_at(src, self.dim, 0, position)
     }
@@ -194,8 +223,9 @@ impl KvCache {
         self.v.reset();
     }
 
-    /// Allocates both backing buffers now -- see [`Cache::reserve`]. Call this before capturing
-    /// a graph that appends to this cache, so the allocation isn't captured into it.
+    /// Allocates both backing buffers now -- see [`Cache::reserve`], including why this also
+    /// stops [`reset`](Self::reset) from freeing them. Call this before capturing a graph that
+    /// appends to this cache, so the allocation isn't captured into it.
     pub fn reserve(&mut self, k: &Tensor, v: &Tensor) -> Result<()> {
         self.k.reserve(k)?;
         self.v.reserve(v)?;
@@ -216,6 +246,47 @@ impl KvCache {
     pub fn append_at(&mut self, k: &Tensor, v: &Tensor, position: &Tensor) -> Result<()> {
         self.k.append_at(k, position)?;
         self.v.append_at(v, position)?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use candle_core::{DType, Device, Result, Tensor};
+
+    use super::Cache;
+
+    /// A graph that captured a write to this cache keeps only the raw destination pointer, so
+    /// `reset` freeing the buffer would leave every later replay writing to a freed address.
+    /// `reserve` is the caller declaring that capture is about to happen, so from then on
+    /// `reset` rewinds without deallocating -- observable here as the written slot surviving.
+    #[test]
+    fn reset_keeps_a_reserved_buffer() -> Result<()> {
+        let device = Device::new_cuda_with_stream(0)?;
+        let zeros = Tensor::zeros((1, 1, 1, 2), DType::F32, &device)?;
+        let ones = Tensor::ones((1, 1, 1, 2), DType::F32, &device)?;
+
+        let mut reserved = Cache::new(2, 4);
+        reserved.reserve(&zeros)?;
+        reserved.append(&ones)?;
+        reserved.reset();
+
+        assert_eq!(reserved.current_seq_len(), 0);
+        let data = reserved
+            .all_data()
+            .as_ref()
+            .expect("reset freed a reserved buffer");
+        let slot0 = data.narrow(2, 0, 1)?.flatten_all()?.to_vec1::<f32>()?;
+        assert_eq!(slot0, [1., 1.], "reset reallocated a reserved buffer");
+
+        // A cache that was never reserved keeps the original behaviour: nothing captured it,
+        // so reset is free to hand the memory back.
+        let mut plain = Cache::new(2, 4);
+        plain.append(&ones)?;
+        assert!(plain.all_data().is_some());
+        plain.reset();
+        assert!(plain.all_data().is_none());
+
         Ok(())
     }
 }
