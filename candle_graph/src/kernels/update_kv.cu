@@ -27,6 +27,16 @@ __device__ void copy2d(
 // graph, not the value at that address -- writing a new value to `*dst_o_ptr`
 // between replays (see `copy_inplace`) changes what the next replay writes to
 // without re-capturing anything.
+//
+// That same indirection is why the bound has to be enforced here: `*dst_o_ptr`
+// lives on the device and is rewritten between replays, so the host cannot
+// check it the way it checks `copy2d`'s host-known `dst_o`. Left unchecked, a
+// position past the end of the destination is scaled by `dst_o_stride` and
+// written straight past the allocation. `dst_o_ptr_max` is the largest
+// position that still leaves room for the whole source slab; the host computes
+// it from the destination's extent on the copied dimension, and it is a plain
+// scalar because it does not change between replays (the shapes are fixed at
+// capture time -- only the position moves).
 template<typename T>
 __device__ void copy2d_dynoffset(
   const uint64_t fingerprint,
@@ -34,8 +44,14 @@ __device__ void copy2d_dynoffset(
   uint32_t d1, uint32_t d2,
   uint32_t src_o, uint32_t dst_o_base, uint32_t dst_o_stride,
   uint32_t src_s, uint32_t dst_s,
-  const uint32_t *dst_o_ptr
+  const uint32_t *dst_o_ptr, uint32_t dst_o_ptr_max
 ) {
+  // Uniform across the launch, so an out-of-range position drops the copy whole
+  // rather than clipping it: a partially written slot would leave the
+  // destination in a state the caller has no way to reason about.
+  if (*dst_o_ptr > dst_o_ptr_max) {
+    return;
+  }
   uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= d1 * d2) {
     return;
@@ -66,9 +82,9 @@ void FNNAME( \
   uint32_t d1, uint32_t d2, \
   uint32_t src_o, uint32_t dst_o_base, uint32_t dst_o_stride, \
   uint32_t src_s, uint32_t dst_s, \
-  const uint32_t *dst_o_ptr \
+  const uint32_t *dst_o_ptr, uint32_t dst_o_ptr_max \
 ) { \
-  copy2d_dynoffset(fingerprint, src, dst, d1, d2, src_o, dst_o_base, dst_o_stride, src_s, dst_s, dst_o_ptr); \
+  copy2d_dynoffset(fingerprint, src, dst, d1, d2, src_o, dst_o_base, dst_o_stride, src_s, dst_s, dst_o_ptr, dst_o_ptr_max); \
 } \
 
 COPY2D_OP(float, copy2d_f32)

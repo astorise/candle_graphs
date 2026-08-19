@@ -40,6 +40,7 @@ trait CudaStorageExtension {
         dst_o_stride: usize,
         dst_o_ptr: &CudaStorage,
         dst_o_ptr_offset: usize,
+        dst_o_ptr_max: usize,
     ) -> Result<()>;
 }
 
@@ -60,6 +61,13 @@ pub trait CudaTensorExtension {
     /// `position`'s contents between replays (e.g. via [`copy_inplace`](crate::copy_inplace))
     /// changes where the next replay writes without re-capturing anything. See the
     /// `decode_replay` example.
+    ///
+    /// A `*position` that would run off the end of `self` on `dim` -- `offset + *position +
+    /// src.dims()[dim] > self.dims()[dim]` -- makes the copy a no-op instead of writing out of
+    /// bounds; the bound is enforced in the kernel, since `*position` is only readable there.
+    /// The skip is silent: nothing is returned to report it, because on a replay there is no
+    /// Rust code running to return it to. Callers that need to know a step was dropped have to
+    /// track the position themselves (see [`Cache::append_at`](crate::Cache::append_at)).
     fn slice_set_fingerprinted_at<D: Dim>(
         &self,
         src: &Self,
@@ -192,14 +200,29 @@ impl CudaTensorExtension for Tensor {
             Err(Error::RequiresContiguous { op: "slice-set-at" }.bt())?
         }
         for (dim_idx, (v1, v2)) in self.dims().iter().zip(src.dims().iter()).enumerate() {
-            // `position` is only known at kernel-launch time, so this can't also bounds-check
-            // `*position + src` against `self`'s size on `dim` the way `slice_set_fingerprinted`
-            // does for its host-known `offset` -- that check has to live at the call site
-            // (e.g. `Cache::append_at`'s `max_seq_len` bound), or move into the kernel itself.
+            // `dim` itself is handled below: unlike `slice_set_fingerprinted`, the write position
+            // on `dim` is not fully known here, so the two halves of that bound are checked
+            // separately.
             if dim_idx != dim && v1 != v2 {
                 candle_core::bail!("shape mismatch on dim {dim_idx}, {v1} <> {v2}")
             }
         }
+        // The write covers `offset + *position .. offset + *position + src_dim` on `dim`.
+        // `offset` and `src_dim` are fixed at capture time, so the room they leave is known
+        // here; only `*position` is not, since it lives on the device and is rewritten between
+        // replays. So the host checks the static half and hands the kernel the largest position
+        // that still fits, and the kernel drops the copy when `*position` exceeds it -- see
+        // `dst_o_ptr_max` in `update_kv.cu`. Without that, an out-of-range position is scaled by
+        // the destination stride and written past the allocation, which a safe API must not
+        // allow whatever the caller passes in.
+        let dst_dim = self.dims()[dim];
+        let src_dim = src.dims()[dim];
+        if offset + src_dim > dst_dim {
+            candle_core::bail!(
+                "slice-set-at: shape mismatch on target dim, dst: {dst_dim}, src: {src_dim} + {offset}"
+            )
+        }
+        let position_max = dst_dim - offset - src_dim;
         let block_size: usize = src.dims().iter().skip(1 + dim).product();
         let d1: usize = src.dims().iter().take(dim).product();
         let d2 = block_size * src.dims()[dim];
@@ -227,6 +250,7 @@ impl CudaTensorExtension for Tensor {
                     block_size,
                     position,
                     position_o,
+                    position_max,
                 ),
             _ => Err(Error::DeviceMismatchBinaryOp {
                 lhs: self.device().location(),
@@ -302,6 +326,7 @@ impl CudaStorageExtension for Tensor {
         dst_o_stride: usize,
         dst_o_ptr: &CudaStorage,
         dst_o_ptr_offset: usize,
+        dst_o_ptr_max: usize,
     ) -> Result<()> {
         let dev = &src.device;
         let d1 = d1 as u32;
@@ -315,6 +340,7 @@ impl CudaStorageExtension for Tensor {
         let src_s = src_s as u32;
         let dst_o_base = dst_o_base as u32;
         let dst_o_stride = dst_o_stride as u32;
+        let dst_o_ptr_max = dst_o_ptr_max as u32;
         // `slice_set_fingerprinted_at` already checked `position.dtype() == DType::U32` before
         // calling here; this match is exhaustive-by-construction, not a runtime dtype guard.
         // The pointer is advanced to the view's own element: the storage pointer alone would
@@ -352,6 +378,7 @@ impl CudaStorageExtension for Tensor {
             src_s,
             dst_s,
             position_ptr,
+            dst_o_ptr_max,
         );
         // SAFETY: ffi.
         unsafe { func.launch(cfg, params) }.w()?;
@@ -451,6 +478,70 @@ mod test {
             let expected = if slot == 2 { d as f32 } else { 0. };
             assert_eq!(sum, expected, "slot {slot}: write landed in the wrong slot");
         }
+        Ok(())
+    }
+
+    /// `*position` lives on the device, so nothing on the host can stop a caller -- or a
+    /// replay whose position tensor was advanced one step too far -- from naming a slot past
+    /// the end of the cache. Unbounded, that offset is scaled by the destination stride and
+    /// written straight past the allocation. The kernel drops the copy instead.
+    #[test]
+    fn slice_set_at_skips_out_of_range_position() -> Result<()> {
+        let device = Device::new_cuda_with_stream(0)?;
+
+        let (b, h, max_t, d) = (1, 1, 4, 3);
+        let cache = Tensor::zeros((b, h, max_t, d), DType::F32, &device)?;
+        let tensor = Tensor::ones((b, h, 1, d), DType::F32, &device)?;
+
+        // One past the last writable slot, and a value that would overflow the u32 offset
+        // arithmetic if it were left to wrap.
+        for out_of_range in [max_t as u32, max_t as u32 + 7, u32::MAX] {
+            let position = Tensor::new(&[out_of_range], &device)?;
+            cache.slice_set_fingerprinted_at(&tensor, 2, 0, &position)?;
+            device.synchronize()?;
+            let touched = cache.abs()?.sum_all()?.to_vec0::<f32>()?;
+            assert_eq!(touched, 0., "position {out_of_range} wrote into the cache");
+        }
+
+        // The last in-range slot still writes, so the bound is not off by one.
+        let position = Tensor::new(&[max_t as u32 - 1], &device)?;
+        cache.slice_set_fingerprinted_at(&tensor, 2, 0, &position)?;
+        for slot in 0usize..max_t {
+            let sum = cache
+                .narrow(2, slot, 1)?
+                .abs()?
+                .sum_all()?
+                .to_vec0::<f32>()?;
+            let expected = if slot == max_t - 1 { d as f32 } else { 0. };
+            assert_eq!(sum, expected, "slot {slot}");
+        }
+        Ok(())
+    }
+
+    /// The half of the bound that *is* known on the host -- `offset` plus the source's own
+    /// extent -- is an error rather than a silent skip, since it is wrong for every position.
+    #[test]
+    fn slice_set_at_rejects_a_source_that_cannot_fit() -> Result<()> {
+        let device = Device::new_cuda_with_stream(0)?;
+
+        let (b, h, max_t, d) = (1, 1, 4, 3);
+        let cache = Tensor::zeros((b, h, max_t, d), DType::F32, &device)?;
+        let position = Tensor::new(&[0u32], &device)?;
+
+        // Source longer than the cache: no position can make this fit.
+        let too_long = Tensor::ones((b, h, max_t + 1, d), DType::F32, &device)?;
+        assert!(cache
+            .slice_set_fingerprinted_at(&too_long, 2, 0, &position)
+            .is_err());
+
+        // Fits on its own, but not at this `offset`.
+        let tensor = Tensor::ones((b, h, 2, d), DType::F32, &device)?;
+        assert!(cache
+            .slice_set_fingerprinted_at(&tensor, 2, 3, &position)
+            .is_err());
+        assert!(cache
+            .slice_set_fingerprinted_at(&tensor, 2, 2, &position)
+            .is_ok());
         Ok(())
     }
 

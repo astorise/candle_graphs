@@ -104,11 +104,16 @@ impl Cache {
     /// between replays (e.g. via [`copy_inplace`](crate::graph::copy_inplace)) advances where
     /// the next replay writes.
     ///
-    /// This does not read, advance, or bounds-check `self.current_seq_len` -- there is no
-    /// Rust-side call between replays to do that against. Tracking the decode position and
-    /// keeping it within `max_seq_len` (chosen in [`new`](Self::new)) is the caller's
+    /// This does not read or advance `self.current_seq_len` -- there is no Rust-side call
+    /// between replays to do that against. Tracking the decode position is the caller's
     /// responsibility. `current_data`/`current_seq_len` are not meaningful for a cache driven
     /// through `append_at`; read `all_data()` directly instead.
+    ///
+    /// A position past the end of the cache does not write out of bounds: the kernel drops the
+    /// copy when `*position + src`'s length on `dim` exceeds `max_seq_len` (chosen in
+    /// [`new`](Self::new)). That is a memory-safety backstop, not position tracking -- the
+    /// dropped write is silent, so a caller that runs past `max_seq_len` loses the step rather
+    /// than getting an error, and still has to keep the position in range itself.
     ///
     /// Call [`reserve`](Self::reserve) before capturing if this would otherwise be the first
     /// `append*` on the cache -- see its docs for why a capture-time allocation is a problem.
@@ -198,8 +203,9 @@ impl KvCache {
     }
 
     /// Like [`append`](Self::append), except the write position is read from `position` at
-    /// kernel-launch time -- see [`Cache::append_at`]. This is what makes a graph capturing a
-    /// decode step replayable at a different position each time, without re-capturing.
+    /// kernel-launch time -- see [`Cache::append_at`], including what happens when `position`
+    /// runs past `max_seq_len`. This is what makes a graph capturing a decode step replayable
+    /// at a different position each time, without re-capturing.
     ///
     /// Returns nothing: unlike `append`, there is no meaningful `current_data()` to hand back
     /// (see `append_at`'s docs on why `current_seq_len` isn't tracked here). Reading the
