@@ -66,8 +66,16 @@ __device__ void copy2d_dynoffset(
   }
   uint32_t idx1 = idx / d2;
   uint32_t idx2 = idx - d2 * idx1;
-  uint32_t dst_o = dst_o_base + position * dst_o_stride;
-  (dst + dst_o)[idx1 * dst_s + idx2] = (src + src_o)[idx1 * src_s + idx2];
+  // Widened to 64 bits: the host refuses to launch unless each of `dst_o_base`,
+  // `dst_o_stride` and `dst_o_ptr_max` fits in 32 bits, but their *sum* need not
+  // -- a destination past 4G elements is reachable (a bf16 KV cache of ~8 GiB
+  // already is), and a wrap would land the write at a wrong offset *inside* the
+  // allocation, which no bounds check can catch because it is still in range.
+  const uint64_t dst_index = (uint64_t)dst_o_base
+                           + (uint64_t)position * dst_o_stride
+                           + (uint64_t)idx1 * dst_s + idx2;
+  const uint64_t src_index = (uint64_t)src_o + (uint64_t)idx1 * src_s + idx2;
+  dst[dst_index] = src[src_index];
 }
 
 #define COPY2D_OP(TYPENAME, FNNAME) \

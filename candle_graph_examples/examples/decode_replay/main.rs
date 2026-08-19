@@ -37,15 +37,26 @@ fn main() -> anyhow::Result<()> {
     // captured into the graph, so every replay would wipe the cache before writing its slot.
     cache.reserve(&k, &v)?;
 
+    // The capture records the cache's device addresses, not the cache itself, so the graph has
+    // to hold its own reference to the backing buffers -- otherwise dropping `cache` while the
+    // graph is still replayable would free the memory each replay keeps writing to. Here `cache`
+    // outlives the graph anyway, but a decode loop that owns the graph and drops the cache
+    // between sequences would not.
+    let retained = [cache.k_cache(), cache.v_cache()]
+        .iter()
+        .filter_map(|c| c.all_data().clone())
+        .collect();
+
     // Capture once: one decode step, writing at whatever `position` holds when
     // the graph runs -- not at a position fixed here during capture.
-    let graph = Graph::new(
+    let graph = Graph::new_retaining(
         |inputs: &Inputs| {
             cache.append_at(&inputs.k, &inputs.v, &inputs.position)?;
             Ok(())
         },
         &device,
         Inputs { k, v, position },
+        retained,
     )?;
 
     // Replay it once per decode step, writing a distinguishable value each

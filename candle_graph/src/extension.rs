@@ -383,7 +383,15 @@ impl CudaStorageExtension for Tensor {
             ))?,
         };
         let func = dev.get_or_load_func(kname, kernels::UPDATE_KV)?;
-        let cfg = LaunchConfig::for_num_elems(d1 * d2);
+        // The kernel compares its thread index against `d1 * d2` in 32 bits too, so this has to
+        // hold there as well, not just for the launch config.
+        let Some(num_elems) = d1.checked_mul(d2) else {
+            candle_core::bail!(
+                "slice-set-at: element count ({d1} * {d2}) does not fit in u32; \
+                 the copy2d kernels index in 32 bits"
+            )
+        };
+        let cfg = LaunchConfig::for_num_elems(num_elems);
         let params = (
             COPY2D_FINGERPRINT,
             src,

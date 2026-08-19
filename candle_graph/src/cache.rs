@@ -74,9 +74,14 @@ impl Cache {
     ///
     /// This also pins the buffer: [`reset`](Self::reset) stops freeing it, because a graph that
     /// captured a write to this cache keeps only the raw destination pointer and would go on
-    /// writing to the freed address. Drop the `Cache` to release the memory. A consequence is
-    /// that a reserved cache keeps its shape across `reset`, so appending a differently shaped
-    /// batch afterwards is an error rather than a silent reallocation.
+    /// writing to the freed address. A consequence is that a reserved cache keeps its shape
+    /// across `reset`, so appending a differently shaped batch afterwards is an error rather
+    /// than a silent reallocation.
+    ///
+    /// Dropping the `Cache` still frees the buffer, and `reset` cannot help with that. Hand
+    /// [`all_data`](Self::all_data) to
+    /// [`Graph::new_retaining`](crate::graph::Graph::new_retaining) so the graph holds its own
+    /// reference and outliving the cache is safe.
     pub fn reserve(&mut self, like: &Tensor) -> Result<()> {
         self.alloc(like)?;
         // Calling this is the caller saying the buffer is about to be captured. A graph that

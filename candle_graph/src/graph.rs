@@ -182,6 +182,14 @@ pub struct Graph<T: GraphInput> {
     stream: CUstream,
     device: Device,
     input: T,
+    /// Tensors the capture baked in as raw device addresses but that the graph does not
+    /// otherwise own. Nothing on the replay path would notice the Rust side dropping one -- the
+    /// replay keeps writing to the address either way -- so a dropped tensor turns every later
+    /// replay into a write to freed memory. Candle tensors are refcounted, so holding a clone
+    /// keeps the allocation alive exactly as long as the graph can replay into it. `input` is
+    /// already covered; this is for everything the captured closure touched by reference, such
+    /// as a `Cache`'s backing buffer.
+    _retained: Vec<Tensor>,
     ran_graph: Cell<bool>,
     // CUgraph is not thread safe!
     _marker: PhantomData<*const ()>,
@@ -191,10 +199,33 @@ impl<T: GraphInput> Graph<T> {
     /// Initialize a CUDA graph, executing the closure to capture a graph.
     ///
     /// The input tensors provided must all be contiguous.
+    ///
+    /// Anything the closure writes to besides `input` -- a KV cache, say -- must outlive the
+    /// graph, since the capture keeps only its device address. Use
+    /// [`new_retaining`](Self::new_retaining) to hand that responsibility to the graph.
     pub fn new(
         from_code: impl FnOnce(&T) -> anyhow::Result<()>,
         device: &Device,
         input: T,
+    ) -> anyhow::Result<Self> {
+        Self::new_retaining(from_code, device, input, Vec::new())
+    }
+
+    /// Like [`new`](Self::new), but keeps `retained` alive for as long as the graph can replay.
+    ///
+    /// A capture records device addresses, not tensors. Whatever the closure wrote to that is
+    /// not part of `input` is still owned by the caller, and dropping it frees the allocation
+    /// the graph goes on replaying into -- silently, because there is no Rust code on the replay
+    /// path to notice. Passing those tensors here makes the graph hold its own reference, so the
+    /// caller is free to drop theirs.
+    ///
+    /// For a cache, that is [`Cache::all_data`](crate::cache::Cache::all_data) after
+    /// [`Cache::reserve`](crate::cache::Cache::reserve) -- see the `decode_replay` example.
+    pub fn new_retaining(
+        from_code: impl FnOnce(&T) -> anyhow::Result<()>,
+        device: &Device,
+        input: T,
+        retained: Vec<Tensor>,
     ) -> anyhow::Result<Self> {
         let cu_device = match &device {
             Device::Cuda(dev) => dev,
@@ -352,6 +383,7 @@ impl<T: GraphInput> Graph<T> {
             stream: *cu_stream,
             device: device.clone(),
             input,
+            _retained: retained,
             _marker: PhantomData,
             ran_graph: Cell::new(false),
         })
